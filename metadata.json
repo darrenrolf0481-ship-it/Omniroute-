@@ -1,0 +1,8 @@
+{
+  "name": "OmniScan Converter",
+  "description": "Convert MHT, BIN, JSON and other uncommon files to TXT, MD, PDF, or JSON. Includes a powerful keyword scanner.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
