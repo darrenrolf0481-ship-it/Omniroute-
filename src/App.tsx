@@ -17,6 +17,13 @@ interface ScannedFile {
 // Global non-reactive memory cache to prevent massive files from loading into React state
 const parsedTextCache = new Map<string, string>();
 
+// Caps that keep search results and print previews from ballooning the DOM /
+// heap when scanning very large documents (a single minified-JSON "line" can be
+// hundreds of megabytes on its own).
+const MAX_MATCHES = 5000;
+const MAX_MATCH_LENGTH = 1000;
+const PREVIEW_CHAR_LIMIT = 100000;
+
 function getFileId(file: File): string {
   return `${file.name}-${file.size}-${file.lastModified}`;
 }
@@ -126,12 +133,13 @@ function AppContent() {
             detectedType,
             typeColor
           });
-        } catch {
+        } catch (parseErr) {
           const fileId = getFileId(file);
+          const message = parseErr instanceof Error ? parseErr.message : 'Failed to parse file.';
           parsedFiles.push({
             id: fileId,
             file,
-            previewText: "[ERROR] Failed to parse file.",
+            previewText: `[ERROR] ${message}`,
             detectedType: 'ERR',
             typeColor: 'text-red-400 border-red-500/20 bg-red-500/10'
           });
@@ -187,57 +195,57 @@ function AppContent() {
     const scanId = (activeScansRef.current[fileId] || 0) + 1;
     activeScansRef.current[fileId] = scanId;
 
-    const lines = fullText.split('\n');
+    // Walk the text line-by-line via indexOf instead of split('\n'), which would
+    // materialize a full second copy of a potentially huge document.
     const matches: string[] = [];
-    const chunkSize = 2000; // scan 2000 lines at a time
-    let index = 0;
+    const linesPerTick = 2000;
+    let pos = 0;
 
-    const scanChunk = async () => {
+    let regex: RegExp | null = null;
+    if (isRegex) {
+      try {
+        regex = new RegExp(keywordsList[0], 'i');
+      } catch (e) {
+        regex = null; // invalid regex
+      }
+    }
+    const lowerKeywords = keywordsList.map(kw => kw.toLowerCase());
+
+    while (pos < fullText.length && matches.length < MAX_MATCHES) {
       if (activeScansRef.current[fileId] !== scanId) {
         return; // Search cancelled or outdated
       }
 
-      const end = Math.min(index + chunkSize, lines.length);
-      
-      if (isRegex) {
-        try {
-          const regex = new RegExp(keywordsList[0], 'i');
-          for (let i = index; i < end; i++) {
-            const line = lines[i];
-            if (line.trim().length > 0 && regex.test(line)) {
-              matches.push(line.trim());
-            }
-          }
-        } catch (e) {
-          // invalid regex
-        }
-      } else {
-        for (let i = index; i < end; i++) {
-          const line = lines[i];
-          if (line.trim().length === 0) continue;
+      for (let n = 0; n < linesPerTick && pos < fullText.length; n++) {
+        let newline = fullText.indexOf('\n', pos);
+        if (newline === -1) newline = fullText.length;
+        const line = fullText.slice(pos, newline).trim();
+        pos = newline + 1;
+
+        if (line.length === 0) continue;
+
+        let isMatch = false;
+        if (isRegex) {
+          isMatch = regex !== null && regex.test(line);
+        } else {
           const lowerLine = line.toLowerCase();
-          const isMatch = keywordsList.some(kw => lowerLine.includes(kw.toLowerCase()));
-          if (isMatch) {
-            matches.push(line.trim());
-          }
+          isMatch = lowerKeywords.some(kw => lowerLine.includes(kw));
+        }
+        if (isMatch) {
+          matches.push(line.length > MAX_MATCH_LENGTH ? `${line.slice(0, MAX_MATCH_LENGTH)} […]` : line);
+          if (matches.length >= MAX_MATCHES) break;
         }
       }
 
-      index = end;
+      // Yield execution to the browser thread to maintain 60fps
+      await new Promise(r => setTimeout(r, 0));
+    }
 
-      if (index < lines.length) {
-        // Yield execution to the browser thread to maintain 60fps
-        await new Promise(r => setTimeout(r, 0));
-        await scanChunk();
-      } else {
-        setSearchResults(prev => ({
-          ...prev,
-          [fileId]: { matches, isSearching: false }
-        }));
-      }
-    };
-
-    await scanChunk();
+    if (activeScansRef.current[fileId] !== scanId) return;
+    setSearchResults(prev => ({
+      ...prev,
+      [fileId]: { matches, isSearching: false }
+    }));
   };
 
   // Trigger search updates reactively
@@ -401,12 +409,18 @@ function AppContent() {
     const f = activeFile;
     if (!f) return <div className="text-white/50">No file selected.</div>;
 
-    const fullText = parsedTextCache.get(f.id) || f.previewText;
+    const cachedText = parsedTextCache.get(f.id) || f.previewText;
+    // Only render a slice into the DOM — the downloaded file still gets the full text.
+    const isTruncated = cachedText.length > PREVIEW_CHAR_LIMIT;
+    const fullText = isTruncated
+      ? `${cachedText.slice(0, PREVIEW_CHAR_LIMIT)}\n\n[... Preview truncated for performance — the downloaded file will contain the full document.]`
+      : cachedText;
     const fileMatches = searchResults[f.id]?.matches || [];
+    const previewMatches = fileMatches.slice(0, 200);
     let contentToExport = fullText;
 
     if (activeKeywords.length > 0 && fileMatches.length > 0) {
-      contentToExport = `--- SCAN RESULTS ---\nKeywords: ${activeKeywords.join(', ')}\nMatches found: ${fileMatches.length}\n\n[MATCHES]\n${fileMatches.join('\n\n')}\n\n[FULL TEXT]\n${fullText}`;
+      contentToExport = `--- SCAN RESULTS ---\nKeywords: ${activeKeywords.join(', ')}\nMatches found: ${fileMatches.length}\n\n[MATCHES]\n${previewMatches.join('\n\n')}\n\n[FULL TEXT]\n${fullText}`;
     }
 
     if (previewFormat === 'json') {
@@ -414,7 +428,7 @@ function AppContent() {
         originalFile: f.file.name,
         keywords: activeKeywords,
         matchCount: fileMatches.length,
-        matches: fileMatches,
+        matches: previewMatches,
         fullText: fullText
       };
       return <pre className="font-mono text-xs whitespace-pre-wrap text-slate-800">{JSON.stringify(jsonContent, null, 2)}</pre>;
@@ -423,7 +437,7 @@ function AppContent() {
     if (previewFormat === 'md') {
       let mdContent = contentToExport;
       if (activeKeywords.length > 0 && fileMatches.length > 0) {
-        mdContent = `# Scan Results\n**Keywords:** ${activeKeywords.join(', ')}\n**Matches found:** ${fileMatches.length}\n\n## Matches\n\n${fileMatches.map(m => `> ${m}`).join('\n\n')}\n\n## Full Text\n\n\`\`\`\n${fullText}\n\`\`\``;
+        mdContent = `# Scan Results\n**Keywords:** ${activeKeywords.join(', ')}\n**Matches found:** ${fileMatches.length}\n\n## Matches\n\n${previewMatches.map(m => `> ${m}`).join('\n\n')}\n\n## Full Text\n\n\`\`\`\n${fullText}\n\`\`\``;
       }
       return <pre className="font-mono text-xs whitespace-pre-wrap text-slate-800">{mdContent}</pre>;
     }
