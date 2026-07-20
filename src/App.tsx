@@ -5,6 +5,7 @@ import { cn } from './lib/utils';
 import { parseFile } from './lib/parser';
 import { downloadTxt, downloadMd, downloadJson, downloadPdf, downloadBatchZip } from './lib/exportUtils';
 import JSZip from 'jszip';
+import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer, Cell, YAxis } from 'recharts';
 
 interface ScannedFile {
   id: string;
@@ -74,7 +75,9 @@ const getFileTypeInfo = (file: File, parsedText: string) => {
 
 function AppContent() {
   const [files, setFiles] = useState<ScannedFile[]>([]);
-  const [activeFileIndex, setActiveFileIndex] = useState<number>(-1);
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
+  const [sortOption, setSortOption] = useState<string>("default");
   const [keywords, setKeywords] = useState<string>("");
   const [useRegex, setUseRegex] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
@@ -82,6 +85,82 @@ function AppContent() {
   const [error, setError] = useState<string | null>(null);
   const [previewFormat, setPreviewFormat] = useState<'txt' | 'md' | 'json' | 'pdf' | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [copied, setCopied] = useState<boolean>(false);
+
+  const activeFile = activeFileId ? files.find(f => f.id === activeFileId) || null : null;
+
+  const sortedFiles = useMemo(() => {
+    if (sortOption === "default") return files;
+    const sorted = [...files];
+    if (sortOption === "name-asc") sorted.sort((a, b) => a.file.name.localeCompare(b.file.name));
+    else if (sortOption === "name-desc") sorted.sort((a, b) => b.file.name.localeCompare(a.file.name));
+    else if (sortOption === "size-asc") sorted.sort((a, b) => a.file.size - b.file.size);
+    else if (sortOption === "size-desc") sorted.sort((a, b) => b.file.size - a.file.size);
+    else if (sortOption === "type-asc") sorted.sort((a, b) => {
+      const extA = a.file.name.split('.').pop()?.toLowerCase() || '';
+      const extB = b.file.name.split('.').pop()?.toLowerCase() || '';
+      return extA.localeCompare(extB) || a.file.name.localeCompare(b.file.name);
+    });
+    else if (sortOption === "type-desc") sorted.sort((a, b) => {
+      const extA = a.file.name.split('.').pop()?.toLowerCase() || '';
+      const extB = b.file.name.split('.').pop()?.toLowerCase() || '';
+      return extB.localeCompare(extA) || b.file.name.localeCompare(a.file.name);
+    });
+    return sorted;
+  }, [files, sortOption]);
+
+  const activeKeywords = useMemo(() => {
+    if (useRegex) {
+      if (keywords.trim().length === 0) return [];
+      return [keywords.trim()];
+    }
+    return keywords.split(',').map(k => k.trim()).filter(k => k.length > 0);
+  }, [keywords, useRegex]);
+
+
+
+  const handleCopyText = async (textToCopy: string) => {
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      setError("Failed to copy text to clipboard.");
+    }
+  };
+
+  const getPreviewFormattedContent = (format: 'txt' | 'md' | 'json' | 'pdf' | null) => {
+    if (!format || !activeFile) return "";
+    const f = activeFile;
+    const fullText = parsedTextCache.get(f.id) || f.previewText;
+    const fileMatches = searchResults[f.id]?.matches || [];
+    let contentToExport = fullText;
+
+    if (activeKeywords.length > 0 && fileMatches.length > 0) {
+      contentToExport = `--- SCAN RESULTS ---\nKeywords: ${activeKeywords.join(', ')}\nMatches found: ${fileMatches.length}\n\n[MATCHES]\n${fileMatches.join('\n\n')}\n\n[FULL TEXT]\n${fullText}`;
+    }
+
+    if (format === 'json') {
+      const jsonContent = {
+        originalFile: f.file.name,
+        keywords: activeKeywords,
+        matchCount: fileMatches.length,
+        matches: fileMatches,
+        fullText: fullText
+      };
+      return JSON.stringify(jsonContent, null, 2);
+    }
+
+    if (format === 'md') {
+      let mdContent = contentToExport;
+      if (activeKeywords.length > 0 && fileMatches.length > 0) {
+        mdContent = `# Scan Results\n**Keywords:** ${activeKeywords.join(', ')}\n**Matches found:** ${fileMatches.length}\n\n## Matches\n\n${fileMatches.map(m => `> ${m}`).join('\n\n')}\n\n## Full Text\n\n\`\`\`\n${fullText}\n\`\`\``;
+      }
+      return mdContent;
+    }
+
+    return contentToExport;
+  };
 
   // Asynchronous Search States
   const [searchResults, setSearchResults] = useState<Record<string, { matches: string[]; isSearching: boolean }>>({});
@@ -147,7 +226,12 @@ function AppContent() {
       }
       
       setFiles((prev) => [...prev, ...parsedFiles]);
-      setActiveFileIndex((prev) => (prev === -1 && parsedFiles.length > 0 ? 0 : prev));
+      setSelectedFileIds((prev) => {
+        const next = new Set(prev);
+        parsedFiles.forEach(f => next.add(f.id));
+        return next;
+      });
+      setActiveFileId((prev) => (!prev && parsedFiles.length > 0 ? parsedFiles[0].id : prev));
     } catch (err) {
       setError("An error occurred while processing files.");
     } finally {
@@ -169,16 +253,6 @@ function AppContent() {
       processFiles(Array.from(e.dataTransfer.files));
     }
   };
-
-  const activeFile = activeFileIndex >= 0 && activeFileIndex < files.length ? files[activeFileIndex] : null;
-
-  const activeKeywords = useMemo(() => {
-    if (useRegex) {
-      if (keywords.trim().length === 0) return [];
-      return [keywords.trim()];
-    }
-    return keywords.split(',').map(k => k.trim()).filter(k => k.length > 0);
-  }, [keywords, useRegex]);
 
   // Run Async scanning in chunks to prevent UI thread lock on large files
   const runAsyncSearch = async (fileId: string, fullText: string, keywordsList: string[], isRegex: boolean) => {
@@ -265,15 +339,31 @@ function AppContent() {
     };
   }, [keywords, useRegex, files.map(f => f.id).join(',')]);
 
+  const chartData = useMemo(() => {
+    return files
+      .map(f => {
+        const matchCount = searchResults[f.id]?.matches?.length || 0;
+        return {
+          name: f.file.name.length > 12 ? f.file.name.substring(0, 12) + '...' : f.file.name,
+          fullName: f.file.name,
+          matches: matchCount
+        };
+      })
+      .filter(d => d.matches > 0)
+      .sort((a, b) => b.matches - a.matches)
+      .slice(0, 5); // top 5
+  }, [files, searchResults]);
+
   const activeFileMatches = activeFile ? (searchResults[activeFile.id]?.matches || []) : [];
   const activeFileSearching = activeFile ? (searchResults[activeFile.id]?.isSearching || false) : false;
 
   const handleExport = async (format: 'txt' | 'md' | 'json' | 'pdf') => {
-    if (files.length === 0) return;
+    const filesToExport = sortedFiles.filter(f => selectedFileIds.has(f.id));
+    if (filesToExport.length === 0) return;
     
-    if (files.length === 1) {
+    if (filesToExport.length === 1) {
       // Single file export
-      const f = files[0];
+      const f = filesToExport[0];
       const baseName = f.file.name.replace(/\.[^/.]+$/, "");
       const outName = `${baseName}_scanned`;
       const fullText = parsedTextCache.get(f.id) || f.previewText;
@@ -306,7 +396,7 @@ function AppContent() {
     } else {
       // Batch export via Zip
       const exportItems: { content: string | object, filename: string, type: 'txt' | 'md' | 'json' | 'pdf' }[] = [];
-      for (const f of files) {
+      for (const f of filesToExport) {
         const baseName = f.file.name.replace(/\.[^/.]+$/, "");
         const fullText = parsedTextCache.get(f.id) || f.previewText;
         const fileMatches = searchResults[f.id]?.matches || [];
@@ -384,10 +474,20 @@ function AppContent() {
         return <span>{nodes}</span>;
       } else {
         const regex = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi');
-        const parts = text.split(regex);
+        
+        let parts = text.split(regex);
+        let isTruncated = false;
+        
+        // Safety limit to prevent React from trying to render 10,000+ nodes and crashing/freezing
+        if (parts.length > 2000) {
+           parts = parts.slice(0, 2000);
+           isTruncated = true;
+        }
+        
         return (
           <span>
             {parts.map((part, i) => {
+              if (part === undefined || part === null) return null;
               const isMatch = keywords.some(k => k.toLowerCase() === part.toLowerCase());
               return isMatch ? (
                 <mark key={i} className="bg-blue-500/30 text-blue-400 font-medium px-1 rounded-sm ring-1 ring-blue-500/50">
@@ -397,6 +497,7 @@ function AppContent() {
                 <span key={i}>{part}</span>
               );
             })}
+            {isTruncated && <span className="text-[10px] text-amber-500 ml-2">[Highlighting limited for performance]</span>}
           </span>
         );
       }
@@ -502,6 +603,65 @@ function AppContent() {
         
         {/* Left Column: Controls */}
         <div className="lg:col-span-4 space-y-6">
+
+          {files.length > 0 && (
+            <section className="bg-white/[0.02] p-6 rounded-xl border border-white/5">
+              <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-4 block">Dashboard Summary</h2>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="bg-black/40 p-3 rounded-lg border border-white/5 text-center flex flex-col items-center justify-center">
+                  <div className="text-xl font-bold text-blue-400">{files.length}</div>
+                  <div className="text-[9px] text-white/40 uppercase tracking-wider mt-1">Files</div>
+                </div>
+                <div className="bg-black/40 p-3 rounded-lg border border-white/5 text-center flex flex-col items-center justify-center">
+                  <div className="text-xl font-bold text-blue-400">
+                    {(files.reduce((acc, f) => acc + f.file.size, 0) / (1024 * 1024)).toFixed(1)}
+                  </div>
+                  <div className="text-[9px] text-white/40 uppercase tracking-wider mt-1">MB Size</div>
+                </div>
+                <div className="bg-black/40 p-3 rounded-lg border border-white/5 text-center flex flex-col items-center justify-center">
+                  <div className="text-xl font-bold text-blue-400">
+                    {files.reduce((acc, f) => acc + (searchResults[f.id]?.matches?.length || 0), 0)}
+                  </div>
+                  <div className="text-[9px] text-white/40 uppercase tracking-wider mt-1">Matches</div>
+                </div>
+              </div>
+
+              {chartData.length > 0 && (
+                <div className="mt-6">
+                  <h3 className="text-[9px] uppercase tracking-widest text-white/40 font-bold mb-3">Top Files by Matches</h3>
+                  <div className="h-40 w-full bg-black/20 rounded-lg p-2 border border-white/5">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={chartData} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
+                        <XAxis 
+                          dataKey="name" 
+                          tick={{ fontSize: 9, fill: 'rgba(255,255,255,0.4)' }} 
+                          axisLine={false} 
+                          tickLine={false} 
+                        />
+                        <YAxis 
+                          tick={{ fontSize: 9, fill: 'rgba(255,255,255,0.4)' }} 
+                          axisLine={false} 
+                          tickLine={false} 
+                          width={40}
+                        />
+                        <Tooltip 
+                          cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                          contentStyle={{ backgroundColor: '#0e1014', borderColor: 'rgba(255,255,255,0.1)', fontSize: '12px', borderRadius: '8px' }}
+                          itemStyle={{ color: '#60a5fa' }}
+                        />
+                        <Bar dataKey="matches" radius={[4, 4, 0, 0]}>
+                          {chartData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={index === 0 ? '#3b82f6' : '#1e3a8a'} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
           <section className="bg-white/[0.02] p-6 rounded-xl border border-white/5">
             <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-4 block">Source Files</h2>
             <div 
@@ -534,37 +694,86 @@ function AppContent() {
             {files.length > 0 && (
               <div className="mt-6">
                 <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Queue ({files.length})</h2>
-                  <button onClick={() => { setFiles([]); setActiveFileIndex(-1); parsedTextCache.clear(); }} className="text-[10px] text-red-400 hover:text-red-300">Clear All</button>
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Queue ({files.length})</h2>
+                    <select 
+                      value={sortOption}
+                      onChange={(e) => setSortOption(e.target.value)}
+                      className="bg-transparent border border-white/10 text-white/60 text-[10px] rounded px-1 py-0.5 outline-none cursor-pointer hover:border-white/20"
+                    >
+                      <option value="default" className="bg-[#0e1014]">Sort: Default</option>
+                      <option value="name-asc" className="bg-[#0e1014]">Name (A-Z)</option>
+                      <option value="name-desc" className="bg-[#0e1014]">Name (Z-A)</option>
+                      <option value="size-asc" className="bg-[#0e1014]">Size (Smallest)</option>
+                      <option value="size-desc" className="bg-[#0e1014]">Size (Largest)</option>
+                      <option value="type-asc" className="bg-[#0e1014]">Type (A-Z)</option>
+                      <option value="type-desc" className="bg-[#0e1014]">Type (Z-A)</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => {
+                        if (selectedFileIds.size === files.length) {
+                          setSelectedFileIds(new Set());
+                        } else {
+                          setSelectedFileIds(new Set(files.map(f => f.id)));
+                        }
+                      }} 
+                      className="text-[10px] text-blue-400 hover:text-blue-300"
+                    >
+                      {selectedFileIds.size === files.length ? "Deselect All" : "Select All"}
+                    </button>
+                    <span className="text-white/20">|</span>
+                    <button onClick={() => { setFiles([]); setActiveFileId(null); setSelectedFileIds(new Set()); parsedTextCache.clear(); }} className="text-[10px] text-red-400 hover:text-red-300">Clear All</button>
+                  </div>
                 </div>
                 <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {files.map((f, idx) => {
+                  {sortedFiles.map((f, idx) => {
                     const isSearching = searchResults[f.id]?.isSearching || false;
                     const matchCount = searchResults[f.id]?.matches?.length || 0;
+                    const isSelected = selectedFileIds.has(f.id);
                     return (
                       <div 
                         key={f.id} 
-                        onClick={() => setActiveFileIndex(idx)}
                         className={cn(
-                          "p-3 rounded-lg border flex items-center gap-3 cursor-pointer transition-colors",
-                          activeFileIndex === idx 
+                          "p-3 rounded-lg border flex items-center gap-3 transition-colors",
+                          activeFileId === f.id 
                             ? "bg-blue-500/10 border-blue-500/20" 
                             : "bg-white/[0.03] border-white/5 hover:border-white/10"
                         )}
                       >
-                        <div className={cn("text-[10px] font-bold font-mono px-2 py-1 rounded w-11 text-center shrink-0 border", f.typeColor)}>
-                          {f.detectedType?.substring(0, 4) || 'FILE'}
-                        </div>
-                        <div className="flex-1 truncate">
-                          <div className="text-xs text-white truncate flex items-center justify-between gap-2" title={f.file.name}>
-                            <span className="truncate">{f.file.name}</span>
-                            {isSearching ? (
-                              <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
-                            ) : activeKeywords.length > 0 && matchCount > 0 ? (
-                              <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
-                            ) : null}
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={(e) => {
+                            const newSet = new Set(selectedFileIds);
+                            if (e.target.checked) {
+                              newSet.add(f.id);
+                            } else {
+                              newSet.delete(f.id);
+                            }
+                            setSelectedFileIds(newSet);
+                          }}
+                          className="w-4 h-4 cursor-pointer accent-blue-500 bg-white/5 border-white/10 rounded shrink-0"
+                        />
+                        <div 
+                          className="flex-1 flex items-center gap-3 cursor-pointer overflow-hidden"
+                          onClick={() => setActiveFileId(f.id)}
+                        >
+                          <div className={cn("text-[10px] font-bold font-mono px-2 py-1 rounded w-11 text-center shrink-0 border", f.typeColor)}>
+                            {f.detectedType?.substring(0, 4) || 'FILE'}
                           </div>
-                          <div className="text-[10px] text-white/40">{(f.file.size / 1024).toFixed(1)} KB</div>
+                          <div className="flex-1 truncate">
+                            <div className="text-xs text-white truncate flex items-center justify-between gap-2" title={f.file.name}>
+                              <span className="truncate">{f.file.name}</span>
+                              {isSearching ? (
+                                <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
+                              ) : activeKeywords.length > 0 && matchCount > 0 ? (
+                                <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
+                              ) : null}
+                            </div>
+                            <div className="text-[10px] text-white/40">{(f.file.size / 1024).toFixed(1)} KB</div>
+                          </div>
                         </div>
                       </div>
                     );
@@ -610,42 +819,42 @@ function AppContent() {
 
           <section className="bg-white/[0.02] p-6 rounded-xl border border-white/5">
             <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-4 block">
-              {files.length > 1 ? `Batch Export (${files.length})` : 'Export Format'}
+              {selectedFileIds.size > 1 ? `Batch Export (${selectedFileIds.size})` : 'Export Format'}
             </h2>
             <div className="grid grid-cols-2 gap-3">
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('txt')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('txt')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <FileText className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">TXT</span>
                 </button>
-                <button onClick={() => setPreviewFormat('txt')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('txt')} disabled={selectedFileIds.size === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('md')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-blue-500/50 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1 ring-1 ring-blue-500/20">
+                <button onClick={() => handleExport('md')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-blue-500/50 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1 ring-1 ring-blue-500/20">
                   <FileText className="w-5 h-5 mb-1 opacity-90" />
                   <span className="text-sm font-bold">Markdown</span>
                 </button>
-                <button onClick={() => setPreviewFormat('md')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('md')} disabled={selectedFileIds.size === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('json')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('json')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <FileJson className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">JSON</span>
                 </button>
-                <button onClick={() => setPreviewFormat('json')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('json')} disabled={selectedFileIds.size === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('pdf')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('pdf')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <Download className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">PDF</span>
                 </button>
-                <button onClick={() => setPreviewFormat('pdf')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('pdf')} disabled={selectedFileIds.size === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
@@ -775,6 +984,11 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
 
   render() {
     if (this.state.hasError) {
+      let errorMessage = "Unknown error";
+      try {
+        errorMessage = this.state.error instanceof Error ? this.state.error.stack || this.state.error.message : String(this.state.error);
+      } catch(e) {}
+      
       return (
         <div className="min-h-screen bg-[#050505] text-white flex items-center justify-center p-8">
           <div className="max-w-xl w-full bg-red-500/10 border border-red-500/20 p-8 rounded-2xl text-center">
@@ -783,7 +997,7 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
             </div>
             <h1 className="text-xl font-bold text-white mb-4">A rendering error occurred</h1>
             <p className="text-red-400 text-sm mb-6 font-mono whitespace-pre-wrap text-left break-all bg-black/40 p-4 rounded-lg overflow-x-auto">
-              {this.state.error?.toString()}
+              {errorMessage}
             </p>
             <button 
               onClick={() => {

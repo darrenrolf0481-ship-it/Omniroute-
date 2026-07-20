@@ -22,14 +22,7 @@ export function downloadPdf(text: string, filename: string) {
   doc.save(`${filename}.pdf`);
 }
 
-// jsPDF's text layout is O(n) main-thread work with heavy per-line overhead; a
-// multi-hundred-MB document would freeze the tab, so cap PDF output size.
-const PDF_CHAR_LIMIT = 1_000_000;
-
 function generatePdfDoc(text: string): jsPDF {
-  if (text.length > PDF_CHAR_LIMIT) {
-    text = `${text.slice(0, PDF_CHAR_LIMIT)}\n\n[Document truncated: source exceeds the PDF export size limit. Use TXT/MD/JSON export for the full content.]`;
-  }
   const doc = new jsPDF();
   const pageHeight = doc.internal.pageSize.height;
   const margin = 15;

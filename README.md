@@ -66,26 +66,24 @@ To handle larger files without crashing or freezing, the application employs sev
 
 ---
 
-## ✅ White-Screen Crash Fix (Web Worker Parsing)
+## ⚠️ Remaining Bottleneck (The White-Screen Crash)
 
-Loading large non-`.txt` files (JSON, MD, MHT, BIN) used to block the browser's main thread for seconds and spike memory to several times the file size, which crashed the renderer — the tab went white, unmounted, and reloaded back to an empty app. The following architecture changes resolve this:
+While chunking and cache offloading have significantly improved load endurance (allowing larger files to start loading and display parsing percentages), extremely large `.mht` or `.bin` files (e.g., **50MB to 200MB+**) still trigger browser tab crashes or white-screens.
 
-1.  **Web Worker Parsing (`src/lib/parser.worker.ts`)**:
-    All file parsing now runs in a background Web Worker (`src/lib/parserCore.ts` holds the shared parsing routines; `src/lib/parser.ts` is the main-thread bridge with a non-worker fallback). The UI thread never blocks during parsing, and if a truly enormous file exhausts the worker's memory, only the worker dies — the app stays alive and shows an error entry for that file instead of white-screening.
-2.  **Guarded JSON Pretty-Printing**:
-    `.json` files are now read in 1MB chunks like every other format. `JSON.parse` + pretty `JSON.stringify` (which can multiply memory usage several times over) only runs for files under **16MB**; larger JSON files are shown raw.
-3.  **Allocation-Free Line Scanning**:
-    The keyword scanner walks the document with `indexOf('\n')` instead of `split('\n')`, which previously materialized a full second copy of the document as an array. Matches are capped at **5,000** and each stored match line is truncated to **1,000 characters**, so a single multi-megabyte minified line can no longer flood React state or the DOM.
-4.  **Bounded Preview & Export Rendering**:
-    The print-preview modal renders at most **100,000 characters** into the DOM (downloads still contain the full document), and PDF export caps layout work at **1,000,000 characters** to keep jsPDF from freezing the tab.
+### Diagnostic Hypotheses for Further Fixes:
 
-Verified headroom: a 118MB single-line minified JSON now loads in ~2 seconds with the UI responsive throughout (worst main-thread stall ~100ms), keyword search over it completes in ~3 seconds, and the preview modal opens instantly.
+1.  **V8 Garbage Collector (GC) Thrashing**:
+    The text-processing pipeline performs numerous string manipulation operations (e.g., `.split('\n')`, `.replace()`, Quoted-Printable character swaps) inside loop iterations. This causes the browser's memory allocation to skyrocket with thousands of short-lived transient strings, leading to long, blocking stop-the-world Garbage Collection pauses that cause the browser tab to hang and eventually crash.
+2.  **String Concatenation Limits**:
+    At the end of chunked parsing, `chunks.join('')` tries to assemble a massive contiguous string in memory. If the resulting text is very large, the V8 engine may run out of addressable string space.
+3.  **UI / Highlight Render Complexity**:
+    Running regular expression checks or split operations on massive strings within the `HighlightedText` component blocks the main thread during DOM paint cycles.
 
-### Possible Future Improvements:
+### Recommended Next Steps for Fixes:
 
+*   **Migrate to Web Workers**:
+    Move the heavy parsing logic inside `src/lib/parser.ts` and the keyword scanning logic inside `App.tsx` completely out of the main thread and into a background **Web Worker**. This will guarantee the browser tab never white-screens, freezes, or crashes, keeping the UI running at 60fps.
 *   **Streamed Chunk Saving**:
     Rather than joining all chunks into a giant string, save the parsed chunks as an array of smaller strings or stream them directly into IndexedDB (`localForage` or similar) to completely avoid massive string heap allocations.
 *   **Virtual List Previewing**:
     Only process and highlight lines currently visible on the screen using a virtual window list (like `react-window` or custom viewport checks) rather than highlighting the entire 50,000-character string at once.
-*   **Worker-Side Keyword Scanning**:
-    Move the keyword scanner into the worker as well, so even the per-line `toLowerCase()`/regex work happens off the main thread.
