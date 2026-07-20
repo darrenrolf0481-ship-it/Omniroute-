@@ -1,5 +1,5 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
-import { Upload, FileText, Download, Search, FileType, FileJson, AlertCircle, Eye, X, Trash2 } from 'lucide-react';
+import { Upload, FileText, Download, Search, FileType, FileJson, AlertCircle, Eye, X, Copy, Check, Trash2 } from 'lucide-react';
 import { cn } from './lib/utils';
 import { parseFile } from './lib/parser';
 import { downloadTxt, downloadMd, downloadJson, downloadPdf, downloadBatchZip } from './lib/exportUtils';
@@ -67,43 +67,27 @@ const getFileTypeInfo = (file: File, parsedText: string) => {
   return { detectedType: detectedType || 'FILE', typeColor };
 };
 
-const parseFileWithWorker = (file: File, onProgress: (p: number) => void): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    try {
-      const worker = new Worker(new URL('./workers/parser.worker.ts', import.meta.url), { type: 'module' });
-      worker.onmessage = (e) => {
-        const { type, progress, text, error } = e.data;
-        if (type === 'PROGRESS') {
-          onProgress(progress);
-        } else if (type === 'COMPLETE') {
-          worker.terminate();
-          resolve(text);
-        } else if (type === 'ERROR') {
-          worker.terminate();
-          reject(new Error(error));
-        }
-      };
-      worker.onerror = (err) => {
-        worker.terminate();
-        parseFile(file, onProgress).then(resolve).catch(reject);
-      };
-      worker.postMessage({ file });
-    } catch {
-      parseFile(file, onProgress).then(resolve).catch(reject);
-    }
-  });
-};
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
 
 function AppContent() {
   const [files, setFiles] = useState<ScannedFile[]>([]);
-  const [activeFileIndex, setActiveFileIndex] = useState<number>(-1);
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
   const [keywords, setKeywords] = useState<string>("");
   const [queueSearch, setQueueSearch] = useState<string>("");
+  const [sortOption, setSortOption] = useState<string>("default");
   const [useRegex, setUseRegex] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [parseProgress, setParseProgress] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
   const [previewFormat, setPreviewFormat] = useState<'txt' | 'md' | 'json' | 'pdf' | null>(null);
+  const [copied, setCopied] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Asynchronous Search States
@@ -176,10 +160,9 @@ function AppContent() {
         try {
           setParseProgress(0);
           
-          // Check IndexedDB persistent cache first
           let text = await getCachedText(fileId);
           if (!text) {
-            text = await parseFileWithWorker(file, (p) => setParseProgress(p));
+            text = await parseFile(file, (p) => setParseProgress(p));
             await setCachedText(fileId, text);
           } else {
             setParseProgress(100);
@@ -197,11 +180,12 @@ function AppContent() {
             detectedType,
             typeColor
           });
-        } catch {
+        } catch (parseErr) {
+          const message = parseErr instanceof Error ? parseErr.message : 'Failed to parse file.';
           parsedFiles.push({
             id: fileId,
             file,
-            previewText: "[ERROR] Failed to parse file.",
+            previewText: `[ERROR] ${message}`,
             detectedType: 'ERR',
             typeColor: 'text-red-400 border-red-500/20 bg-red-500/10'
           });
@@ -209,7 +193,12 @@ function AppContent() {
       }
       
       setFiles((prev) => [...prev, ...parsedFiles]);
-      setActiveFileIndex((prev) => (prev === -1 && parsedFiles.length > 0 ? 0 : prev));
+      setSelectedFileIds((prev) => {
+        const next = new Set(prev);
+        parsedFiles.forEach(f => next.add(f.id));
+        return next;
+      });
+      setActiveFileId((prev) => (!prev && parsedFiles.length > 0 ? parsedFiles[0].id : prev));
     } catch (err) {
       setError("An error occurred while processing files.");
     } finally {
@@ -225,10 +214,16 @@ function AppContent() {
 
     setFiles((prev) => {
       const nextFiles = prev.filter(f => f.id !== fileId);
-      if (activeFileIndex >= nextFiles.length) {
-        setActiveFileIndex(Math.max(-1, nextFiles.length - 1));
+      if (activeFileId === fileId) {
+        setActiveFileId(nextFiles.length > 0 ? nextFiles[0].id : null);
       }
       return nextFiles;
+    });
+
+    setSelectedFileIds((prev) => {
+      const next = new Set(prev);
+      next.delete(fileId);
+      return next;
     });
 
     setSearchResults((prev) => {
@@ -240,7 +235,8 @@ function AppContent() {
 
   const handleClearAll = async () => {
     setFiles([]);
-    setActiveFileIndex(-1);
+    setActiveFileId(null);
+    setSelectedFileIds(new Set());
     parsedTextCache.clear();
     setSearchResults({});
     await clearAllCachedText();
@@ -260,7 +256,19 @@ function AppContent() {
     }
   };
 
-  const activeFile = activeFileIndex >= 0 && activeFileIndex < files.length ? files[activeFileIndex] : null;
+  const handleCopyText = async (textToCopy: string) => {
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      setError("Failed to copy text to clipboard.");
+    }
+  };
+
+  const activeFile = useMemo(() => {
+    return files.find(f => f.id === activeFileId) || null;
+  }, [files, activeFileId]);
 
   const activeKeywords = useMemo(() => {
     if (useRegex) {
@@ -270,15 +278,49 @@ function AppContent() {
     return keywords.split(',').map(k => k.trim()).filter(k => k.length > 0);
   }, [keywords, useRegex]);
 
-  // Filtered Queue list
-  const filteredQueue = useMemo(() => {
-    if (!queueSearch.trim()) return files;
-    const query = queueSearch.toLowerCase().trim();
-    return files.filter(f => 
-      f.file.name.toLowerCase().includes(query) || 
-      f.detectedType.toLowerCase().includes(query)
-    );
-  }, [files, queueSearch]);
+  const sortedFiles = useMemo(() => {
+    let list = [...files];
+
+    if (queueSearch.trim()) {
+      const query = queueSearch.toLowerCase().trim();
+      list = list.filter(f => 
+        f.file.name.toLowerCase().includes(query) || 
+        f.detectedType.toLowerCase().includes(query)
+      );
+    }
+
+    switch (sortOption) {
+      case 'name-asc':
+        return list.sort((a, b) => a.file.name.localeCompare(b.file.name));
+      case 'name-desc':
+        return list.sort((a, b) => b.file.name.localeCompare(a.file.name));
+      case 'size-asc':
+        return list.sort((a, b) => a.file.size - b.file.size);
+      case 'size-desc':
+        return list.sort((a, b) => b.file.size - a.file.size);
+      case 'type-asc':
+        return list.sort((a, b) => a.detectedType.localeCompare(b.detectedType));
+      case 'type-desc':
+        return list.sort((a, b) => b.detectedType.localeCompare(a.detectedType));
+      default:
+        return list;
+    }
+  }, [files, queueSearch, sortOption]);
+
+  const topMatchesSummary = useMemo(() => {
+    if (activeKeywords.length === 0) return [];
+    return files
+      .map(f => {
+        const matchCount = searchResults[f.id]?.totalMatches || 0;
+        return {
+          file: f,
+          matches: matchCount
+        };
+      })
+      .filter(d => d.matches > 0)
+      .sort((a, b) => b.matches - a.matches)
+      .slice(0, 5);
+  }, [files, searchResults, activeKeywords]);
 
   // Delegate search to Web Worker
   useEffect(() => {
@@ -305,11 +347,45 @@ function AppContent() {
   const activeFileTotalMatches = activeFile ? (searchResults[activeFile.id]?.totalMatches || activeFileMatches.length) : 0;
   const activeFileSearching = activeFile ? (searchResults[activeFile.id]?.isSearching || false) : false;
 
+  const getPreviewFormattedContent = (format: 'txt' | 'md' | 'json' | 'pdf' | null) => {
+    if (!format || !activeFile) return "";
+    const f = activeFile;
+    const fullText = parsedTextCache.get(f.id) || f.previewText;
+    const fileMatches = searchResults[f.id]?.matches || [];
+    let contentToExport = fullText;
+
+    if (activeKeywords.length > 0 && fileMatches.length > 0) {
+      contentToExport = `--- SCAN RESULTS ---\nKeywords: ${activeKeywords.join(', ')}\nMatches found: ${fileMatches.length}\n\n[MATCHES]\n${fileMatches.join('\n\n')}\n\n[FULL TEXT]\n${fullText}`;
+    }
+
+    if (format === 'json') {
+      const jsonContent = {
+        originalFile: f.file.name,
+        keywords: activeKeywords,
+        matchCount: fileMatches.length,
+        matches: fileMatches,
+        fullText: fullText
+      };
+      return JSON.stringify(jsonContent, null, 2);
+    }
+
+    if (format === 'md') {
+      let mdContent = contentToExport;
+      if (activeKeywords.length > 0 && fileMatches.length > 0) {
+        mdContent = `# Scan Results\n**Keywords:** ${activeKeywords.join(', ')}\n**Matches found:** ${fileMatches.length}\n\n## Matches\n\n${fileMatches.map(m => `> ${m}`).join('\n\n')}\n\n## Full Text\n\n\`\`\`\n${fullText}\n\`\`\``;
+      }
+      return mdContent;
+    }
+
+    return contentToExport;
+  };
+
   const handleExport = async (format: 'txt' | 'md' | 'json' | 'pdf') => {
-    if (files.length === 0) return;
+    const filesToExport = sortedFiles.filter(f => selectedFileIds.has(f.id));
+    if (filesToExport.length === 0) return;
     
-    if (files.length === 1) {
-      const f = files[0];
+    if (filesToExport.length === 1) {
+      const f = filesToExport[0];
       const baseName = f.file.name.replace(/\.[^/.]+$/, "");
       const outName = `${baseName}_scanned`;
       const fullText = parsedTextCache.get(f.id) || f.previewText;
@@ -341,7 +417,7 @@ function AppContent() {
       }
     } else {
       const exportItems: { content: string | object, filename: string, type: 'txt' | 'md' | 'json' | 'pdf' }[] = [];
-      for (const f of files) {
+      for (const f of filesToExport) {
         const baseName = f.file.name.replace(/\.[^/.]+$/, "");
         const fullText = parsedTextCache.get(f.id) || f.previewText;
         const fileMatches = searchResults[f.id]?.matches || [];
@@ -384,46 +460,6 @@ function AppContent() {
     }
   };
 
-  const renderPreviewContent = () => {
-    const f = activeFile;
-    if (!f) return <div className="text-white/50">No file selected.</div>;
-
-    const fullText = parsedTextCache.get(f.id) || f.previewText;
-    const fileMatches = searchResults[f.id]?.matches || [];
-    let contentToExport = fullText;
-
-    if (activeKeywords.length > 0 && fileMatches.length > 0) {
-      contentToExport = `--- SCAN RESULTS ---\nKeywords: ${activeKeywords.join(', ')}\nMatches found: ${fileMatches.length}\n\n[MATCHES]\n${fileMatches.join('\n\n')}\n\n[FULL TEXT]\n${fullText}`;
-    }
-
-    if (previewFormat === 'json') {
-      const jsonContent = {
-        originalFile: f.file.name,
-        keywords: activeKeywords,
-        matchCount: fileMatches.length,
-        matches: fileMatches,
-        fullText: fullText
-      };
-      return <pre className="font-mono text-xs whitespace-pre-wrap text-slate-800">{JSON.stringify(jsonContent, null, 2)}</pre>;
-    }
-
-    if (previewFormat === 'md') {
-      let mdContent = contentToExport;
-      if (activeKeywords.length > 0 && fileMatches.length > 0) {
-        mdContent = `# Scan Results\n**Keywords:** ${activeKeywords.join(', ')}\n**Matches found:** ${fileMatches.length}\n\n## Matches\n\n${fileMatches.map(m => `> ${m}`).join('\n\n')}\n\n## Full Text\n\n\`\`\`\n${fullText}\n\`\`\``;
-      }
-      return <pre className="font-mono text-xs whitespace-pre-wrap text-slate-800">{mdContent}</pre>;
-    }
-
-    return (
-      <div className={previewFormat === 'pdf' ? "max-w-[180mm] mx-auto bg-white p-8 shadow-sm border border-slate-200" : ""}>
-        <pre className={cn("font-mono text-xs whitespace-pre-wrap", previewFormat === 'pdf' ? "text-black font-sans leading-relaxed" : "text-slate-800")}>
-          {contentToExport}
-        </pre>
-      </div>
-    );
-  };
-
   return (
     <div className="min-h-screen bg-[#0a0b0e] text-slate-300 font-sans selection:bg-blue-500/30">
       {previewFormat && (
@@ -433,12 +469,25 @@ function AppContent() {
               <h2 className="text-sm font-bold text-white uppercase tracking-widest flex items-center gap-2">
                 <Eye className="w-4 h-4 text-blue-400" /> Print Preview: {previewFormat.toUpperCase()}
               </h2>
-              <button onClick={() => setPreviewFormat(null)} className="text-white/40 hover:text-white transition-colors">
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => handleCopyText(getPreviewFormattedContent(previewFormat))}
+                  className="px-3 py-1.5 text-xs bg-white/5 hover:bg-white/10 border border-white/10 text-white/80 hover:text-white rounded-lg transition-colors flex items-center gap-1.5"
+                >
+                  {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copied ? "Copied!" : "Copy Text"}</span>
+                </button>
+                <button onClick={() => setPreviewFormat(null)} className="text-white/40 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-8 bg-slate-100 text-black">
-               {renderPreviewContent()}
+              <div className={previewFormat === 'pdf' ? "max-w-[180mm] mx-auto bg-white p-8 shadow-sm border border-slate-200" : ""}>
+                <pre className={cn("font-mono text-xs whitespace-pre-wrap", previewFormat === 'pdf' ? "text-black font-sans leading-relaxed" : "text-slate-800")}>
+                  {getPreviewFormattedContent(previewFormat)}
+                </pre>
+              </div>
             </div>
             <div className="p-4 border-t border-white/5 bg-[#0e1014] flex justify-end gap-3">
               <button onClick={() => setPreviewFormat(null)} className="px-4 py-2 text-sm text-white/60 hover:text-white transition-colors">Cancel</button>
@@ -493,9 +542,39 @@ function AppContent() {
             
             {files.length > 0 && (
               <div className="mt-6">
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Queue ({files.length})</h2>
-                  <button onClick={handleClearAll} className="text-[10px] text-red-400 hover:text-red-300 transition-colors">Clear All</button>
+                <div className="flex items-center justify-between mb-3 gap-2">
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Queue ({files.length})</h2>
+                    <select 
+                      value={sortOption}
+                      onChange={(e) => setSortOption(e.target.value)}
+                      className="bg-transparent border border-white/10 text-white/60 text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer hover:border-white/20"
+                    >
+                      <option value="default" className="bg-[#0e1014]">Sort: Default</option>
+                      <option value="name-asc" className="bg-[#0e1014]">Name (A-Z)</option>
+                      <option value="name-desc" className="bg-[#0e1014]">Name (Z-A)</option>
+                      <option value="size-asc" className="bg-[#0e1014]">Size (Smallest)</option>
+                      <option value="size-desc" className="bg-[#0e1014]">Size (Largest)</option>
+                      <option value="type-asc" className="bg-[#0e1014]">Type (A-Z)</option>
+                      <option value="type-desc" className="bg-[#0e1014]">Type (Z-A)</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => {
+                        if (selectedFileIds.size === files.length) {
+                          setSelectedFileIds(new Set());
+                        } else {
+                          setSelectedFileIds(new Set(files.map(f => f.id)));
+                        }
+                      }} 
+                      className="text-[10px] text-blue-400 hover:text-blue-300"
+                    >
+                      {selectedFileIds.size === files.length ? "Deselect All" : "Select All"}
+                    </button>
+                    <span className="text-white/20">|</span>
+                    <button onClick={handleClearAll} className="text-[10px] text-red-400 hover:text-red-300 transition-colors">Clear All</button>
+                  </div>
                 </div>
 
                 {files.length > 3 && (
@@ -512,43 +591,61 @@ function AppContent() {
                 )}
 
                 <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {filteredQueue.map((f) => {
-                    const originalIdx = files.findIndex(fileItem => fileItem.id === f.id);
+                  {sortedFiles.map((f) => {
                     const isSearching = searchResults[f.id]?.isSearching || false;
                     const matchCount = searchResults[f.id]?.totalMatches || 0;
+                    const isSelected = selectedFileIds.has(f.id);
                     return (
                       <div 
                         key={f.id} 
-                        onClick={() => setActiveFileIndex(originalIdx)}
                         className={cn(
-                          "p-3 rounded-lg border flex items-center gap-3 cursor-pointer transition-colors group relative",
-                          activeFileIndex === originalIdx 
+                          "p-3 rounded-lg border flex items-center gap-3 transition-colors group relative",
+                          activeFileId === f.id 
                             ? "bg-blue-500/10 border-blue-500/20" 
                             : "bg-white/[0.03] border-white/5 hover:border-white/10"
                         )}
                       >
-                        <div className={cn("text-[10px] font-bold font-mono px-2 py-1 rounded w-11 text-center shrink-0 border", f.typeColor)}>
-                          {f.detectedType?.substring(0, 4) || 'FILE'}
-                        </div>
-                        <div className="flex-1 truncate">
-                          <div className="text-xs text-white truncate flex items-center justify-between gap-2" title={f.file.name}>
-                            <span className="truncate">{f.file.name}</span>
-                            <div className="flex items-center gap-1 shrink-0">
-                              {isSearching ? (
-                                <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
-                              ) : activeKeywords.length > 0 && matchCount > 0 ? (
-                                <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
-                              ) : null}
-                              <button
-                                onClick={(e) => removeFile(f.id, e)}
-                                className="p-1 text-white/20 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100"
-                                title="Remove file"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={(e) => {
+                            const newSet = new Set(selectedFileIds);
+                            if (e.target.checked) {
+                              newSet.add(f.id);
+                            } else {
+                              newSet.delete(f.id);
+                            }
+                            setSelectedFileIds(newSet);
+                          }}
+                          className="w-4 h-4 cursor-pointer accent-blue-500 bg-white/5 border-white/10 rounded shrink-0"
+                        />
+                        <div 
+                          className="flex-1 flex items-center gap-3 cursor-pointer overflow-hidden"
+                          onClick={() => setActiveFileId(f.id)}
+                        >
+                          <div className={cn("text-[10px] font-bold font-mono px-2 py-1 rounded w-11 text-center shrink-0 border", f.typeColor)}>
+                            {f.detectedType?.substring(0, 4) || 'FILE'}
                           </div>
-                          <div className="text-[10px] text-white/40">{(f.file.size / 1024).toFixed(1)} KB</div>
+                          <div className="flex-1 truncate">
+                            <div className="text-xs text-white truncate flex items-center justify-between gap-2" title={f.file.name}>
+                              <span className="truncate">{f.file.name}</span>
+                              <div className="flex items-center gap-1 shrink-0">
+                                {isSearching ? (
+                                  <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
+                                ) : activeKeywords.length > 0 && matchCount > 0 ? (
+                                  <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
+                                ) : null}
+                                <button
+                                  onClick={(e) => removeFile(f.id, e)}
+                                  className="p-1 text-white/20 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100"
+                                  title="Remove file"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="text-[10px] text-white/40">{(f.file.size / 1024).toFixed(1)} KB</div>
+                          </div>
                         </div>
                       </div>
                     );
@@ -590,46 +687,66 @@ function AppContent() {
                 ))}
               </div>
             )}
+
+            {topMatchesSummary.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-white/5">
+                <div className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-2">Top Hits by File</div>
+                <div className="space-y-1.5">
+                  {topMatchesSummary.map(({ file, matches }) => (
+                    <div 
+                      key={file.id} 
+                      onClick={() => setActiveFileId(file.id)}
+                      className="flex items-center justify-between text-xs p-2 rounded bg-white/[0.02] hover:bg-white/[0.05] cursor-pointer transition-colors border border-white/5"
+                    >
+                      <span className="truncate text-white/80 pr-2">{file.file.name}</span>
+                      <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded font-mono font-bold shrink-0">
+                        {matches} {matches === 1 ? 'hit' : 'hits'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
 
           <section className="bg-white/[0.02] p-6 rounded-xl border border-white/5">
             <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-4 block">
-              {files.length > 1 ? `Batch Export (${files.length})` : 'Export Format'}
+              {selectedFileIds.size > 1 ? `Batch Export (${selectedFileIds.size} Selected)` : 'Export Format'}
             </h2>
             <div className="grid grid-cols-2 gap-3">
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('txt')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('txt')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <FileText className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">TXT</span>
                 </button>
-                <button onClick={() => setPreviewFormat('txt')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('txt')} disabled={!activeFile} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('md')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-blue-500/50 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1 ring-1 ring-blue-500/20">
+                <button onClick={() => handleExport('md')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-blue-500/50 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1 ring-1 ring-blue-500/20">
                   <FileText className="w-5 h-5 mb-1 opacity-90" />
                   <span className="text-sm font-bold">Markdown</span>
                 </button>
-                <button onClick={() => setPreviewFormat('md')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('md')} disabled={!activeFile} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('json')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('json')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <FileJson className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">JSON</span>
                 </button>
-                <button onClick={() => setPreviewFormat('json')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('json')} disabled={!activeFile} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
               <div className="relative group flex flex-col">
-                <button onClick={() => handleExport('pdf')} disabled={files.length === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
+                <button onClick={() => handleExport('pdf')} disabled={selectedFileIds.size === 0} className="w-full flex-1 py-4 rounded-xl border border-white/10 bg-white/5 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex flex-col items-center justify-center gap-1">
                   <Download className="w-5 h-5 mb-1 opacity-70" />
                   <span className="text-sm font-bold">PDF</span>
                 </button>
-                <button onClick={() => setPreviewFormat('pdf')} disabled={files.length === 0} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
+                <button onClick={() => setPreviewFormat('pdf')} disabled={!activeFile} className="absolute top-2 right-2 p-1.5 bg-black/40 hover:bg-blue-500/20 text-white/40 hover:text-blue-400 rounded-lg opacity-0 group-hover:opacity-100 transition-all disabled:hidden" title="Print Preview">
                   <Eye className="w-4 h-4" />
                 </button>
               </div>
@@ -760,12 +877,4 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
     }
     return this.props.children;
   }
-}
-
-export default function App() {
-  return (
-    <ErrorBoundary>
-      <AppContent />
-    </ErrorBoundary>
-  );
 }
