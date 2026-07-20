@@ -1,20 +1,22 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
-import { Upload, FileText, Download, Search, FileType, FileJson, AlertCircle, Eye, X } from 'lucide-react';
+import { Upload, FileText, Download, Search, FileType, FileJson, AlertCircle, Eye, X, Trash2 } from 'lucide-react';
 import { cn } from './lib/utils';
 import { parseFile } from './lib/parser';
 import { downloadTxt, downloadMd, downloadJson, downloadPdf, downloadBatchZip } from './lib/exportUtils';
+import { VirtualizedText, HighlightedLine } from './components/VirtualizedText';
+import { getCachedText, setCachedText, deleteCachedText, clearAllCachedText } from './lib/db';
+import type { SearchResultData } from './workers/search.worker';
 import JSZip from 'jszip';
 
 interface ScannedFile {
   id: string;
   file: File;
-  previewText: string; // First 50,000 characters for render preview
+  previewText: string;
   detectedType: string;
   typeColor: string;
 }
 
-// Global non-reactive memory cache to prevent massive files from loading into React state
+// Memory cache for active session fast access
 const parsedTextCache = new Map<string, string>();
 
 function getFileId(file: File): string {
@@ -65,10 +67,38 @@ const getFileTypeInfo = (file: File, parsedText: string) => {
   return { detectedType: detectedType || 'FILE', typeColor };
 };
 
+const parseFileWithWorker = (file: File, onProgress: (p: number) => void): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    try {
+      const worker = new Worker(new URL('./workers/parser.worker.ts', import.meta.url), { type: 'module' });
+      worker.onmessage = (e) => {
+        const { type, progress, text, error } = e.data;
+        if (type === 'PROGRESS') {
+          onProgress(progress);
+        } else if (type === 'COMPLETE') {
+          worker.terminate();
+          resolve(text);
+        } else if (type === 'ERROR') {
+          worker.terminate();
+          reject(new Error(error));
+        }
+      };
+      worker.onerror = (err) => {
+        worker.terminate();
+        parseFile(file, onProgress).then(resolve).catch(reject);
+      };
+      worker.postMessage({ file });
+    } catch {
+      parseFile(file, onProgress).then(resolve).catch(reject);
+    }
+  });
+};
+
 function AppContent() {
   const [files, setFiles] = useState<ScannedFile[]>([]);
   const [activeFileIndex, setActiveFileIndex] = useState<number>(-1);
   const [keywords, setKeywords] = useState<string>("");
+  const [queueSearch, setQueueSearch] = useState<string>("");
   const [useRegex, setUseRegex] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [parseProgress, setParseProgress] = useState<number>(0);
@@ -77,14 +107,37 @@ function AppContent() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Asynchronous Search States
-  const [searchResults, setSearchResults] = useState<Record<string, { matches: string[]; isSearching: boolean }>>({});
+  const [searchResults, setSearchResults] = useState<Record<string, { matches: string[]; totalMatches: number; isSearching: boolean }>>({});
   const activeScansRef = useRef<Record<string, number>>({});
+  const searchWorkerRef = useRef<Worker | null>(null);
+
+  // Initialize search worker
+  useEffect(() => {
+    try {
+      const worker = new Worker(new URL('./workers/search.worker.ts', import.meta.url), { type: 'module' });
+      worker.onmessage = (e: MessageEvent<SearchResultData>) => {
+        const { scanId, fileId, matches, totalMatches, isSearching } = e.data;
+        if (activeScansRef.current[fileId] === scanId) {
+          setSearchResults(prev => ({
+            ...prev,
+            [fileId]: { matches, totalMatches, isSearching }
+          }));
+        }
+      };
+      searchWorkerRef.current = worker;
+    } catch (err) {
+      console.warn("Search worker initialization failed", err);
+    }
+
+    return () => {
+      searchWorkerRef.current?.terminate();
+    };
+  }, []);
 
   const processFiles = async (newFiles: File[]) => {
     setIsProcessing(true);
     setError(null);
     
-    // Yield to the event loop so the browser can render the loading spinner
     await new Promise(r => setTimeout(r, 50));
 
     try {
@@ -108,12 +161,30 @@ function AppContent() {
         }
       }
 
+      // Deduplicate files by ID
+      const existingIds = new Set(files.map(f => f.id));
+      const filteredFiles = allFiles.filter(f => !existingIds.has(getFileId(f)));
+
+      if (filteredFiles.length === 0 && allFiles.length > 0) {
+        setError("Selected file(s) are already in the queue.");
+        return;
+      }
+
       const parsedFiles: ScannedFile[] = [];
-      for (const file of allFiles) {
+      for (const file of filteredFiles) {
+        const fileId = getFileId(file);
         try {
           setParseProgress(0);
-          const text = await parseFile(file, (p) => setParseProgress(p));
-          const fileId = getFileId(file);
+          
+          // Check IndexedDB persistent cache first
+          let text = await getCachedText(fileId);
+          if (!text) {
+            text = await parseFileWithWorker(file, (p) => setParseProgress(p));
+            await setCachedText(fileId, text);
+          } else {
+            setParseProgress(100);
+          }
+
           parsedTextCache.set(fileId, text);
           
           const previewText = text.substring(0, 50000);
@@ -127,7 +198,6 @@ function AppContent() {
             typeColor
           });
         } catch {
-          const fileId = getFileId(file);
           parsedFiles.push({
             id: fileId,
             file,
@@ -147,11 +217,39 @@ function AppContent() {
     }
   };
 
+  const removeFile = async (fileId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    
+    await deleteCachedText(fileId);
+    parsedTextCache.delete(fileId);
+
+    setFiles((prev) => {
+      const nextFiles = prev.filter(f => f.id !== fileId);
+      if (activeFileIndex >= nextFiles.length) {
+        setActiveFileIndex(Math.max(-1, nextFiles.length - 1));
+      }
+      return nextFiles;
+    });
+
+    setSearchResults((prev) => {
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  };
+
+  const handleClearAll = async () => {
+    setFiles([]);
+    setActiveFileIndex(-1);
+    parsedTextCache.clear();
+    setSearchResults({});
+    await clearAllCachedText();
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       processFiles(Array.from(e.target.files));
     }
-    // reset input so same files can be selected again if needed
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -172,99 +270,45 @@ function AppContent() {
     return keywords.split(',').map(k => k.trim()).filter(k => k.length > 0);
   }, [keywords, useRegex]);
 
-  // Run Async scanning in chunks to prevent UI thread lock on large files
-  const runAsyncSearch = async (fileId: string, fullText: string, keywordsList: string[], isRegex: boolean) => {
-    if (keywordsList.length === 0) {
-      setSearchResults(prev => ({ ...prev, [fileId]: { matches: [], isSearching: false } }));
-      return;
-    }
+  // Filtered Queue list
+  const filteredQueue = useMemo(() => {
+    if (!queueSearch.trim()) return files;
+    const query = queueSearch.toLowerCase().trim();
+    return files.filter(f => 
+      f.file.name.toLowerCase().includes(query) || 
+      f.detectedType.toLowerCase().includes(query)
+    );
+  }, [files, queueSearch]);
 
-    setSearchResults(prev => ({
-      ...prev,
-      [fileId]: { matches: prev[fileId]?.matches || [], isSearching: true }
-    }));
-
-    const scanId = (activeScansRef.current[fileId] || 0) + 1;
-    activeScansRef.current[fileId] = scanId;
-
-    const lines = fullText.split('\n');
-    const matches: string[] = [];
-    const chunkSize = 2000; // scan 2000 lines at a time
-    let index = 0;
-
-    const scanChunk = async () => {
-      if (activeScansRef.current[fileId] !== scanId) {
-        return; // Search cancelled or outdated
-      }
-
-      const end = Math.min(index + chunkSize, lines.length);
-      
-      if (isRegex) {
-        try {
-          const regex = new RegExp(keywordsList[0], 'i');
-          for (let i = index; i < end; i++) {
-            const line = lines[i];
-            if (line.trim().length > 0 && regex.test(line)) {
-              matches.push(line.trim());
-            }
-          }
-        } catch (e) {
-          // invalid regex
-        }
-      } else {
-        for (let i = index; i < end; i++) {
-          const line = lines[i];
-          if (line.trim().length === 0) continue;
-          const lowerLine = line.toLowerCase();
-          const isMatch = keywordsList.some(kw => lowerLine.includes(kw.toLowerCase()));
-          if (isMatch) {
-            matches.push(line.trim());
-          }
-        }
-      }
-
-      index = end;
-
-      if (index < lines.length) {
-        // Yield execution to the browser thread to maintain 60fps
-        await new Promise(r => setTimeout(r, 0));
-        await scanChunk();
-      } else {
-        setSearchResults(prev => ({
-          ...prev,
-          [fileId]: { matches, isSearching: false }
-        }));
-      }
-    };
-
-    await scanChunk();
-  };
-
-  // Trigger search updates reactively
+  // Delegate search to Web Worker
   useEffect(() => {
     if (files.length === 0) return;
 
     files.forEach(f => {
       const fullText = parsedTextCache.get(f.id) || f.previewText;
-      runAsyncSearch(f.id, fullText, activeKeywords, useRegex);
-    });
+      const scanId = (activeScansRef.current[f.id] || 0) + 1;
+      activeScansRef.current[f.id] = scanId;
 
-    return () => {
-      // Cancel active searches on query changes
-      files.forEach(f => {
-        activeScansRef.current[f.id] = (activeScansRef.current[f.id] || 0) + 1;
-      });
-    };
-  }, [keywords, useRegex, files.map(f => f.id).join(',')]);
+      if (searchWorkerRef.current) {
+        searchWorkerRef.current.postMessage({
+          scanId,
+          fileId: f.id,
+          text: fullText,
+          keywords: activeKeywords,
+          isRegex: useRegex
+        });
+      }
+    });
+  }, [keywords, useRegex, files]);
 
   const activeFileMatches = activeFile ? (searchResults[activeFile.id]?.matches || []) : [];
+  const activeFileTotalMatches = activeFile ? (searchResults[activeFile.id]?.totalMatches || activeFileMatches.length) : 0;
   const activeFileSearching = activeFile ? (searchResults[activeFile.id]?.isSearching || false) : false;
 
   const handleExport = async (format: 'txt' | 'md' | 'json' | 'pdf') => {
     if (files.length === 0) return;
     
     if (files.length === 1) {
-      // Single file export
       const f = files[0];
       const baseName = f.file.name.replace(/\.[^/.]+$/, "");
       const outName = `${baseName}_scanned`;
@@ -296,7 +340,6 @@ function AppContent() {
         downloadPdf(contentToExport, outName);
       }
     } else {
-      // Batch export via Zip
       const exportItems: { content: string | object, filename: string, type: 'txt' | 'md' | 'json' | 'pdf' }[] = [];
       for (const f of files) {
         const baseName = f.file.name.replace(/\.[^/.]+$/, "");
@@ -341,62 +384,6 @@ function AppContent() {
     }
   };
 
-  const HighlightedText = ({ text, keywords, isRegex }: { text: string; keywords: string[]; isRegex?: boolean }) => {
-    if (!text) return null;
-    if (keywords.length === 0) return <span>{text}</span>;
-
-    try {
-      if (isRegex) {
-        const regex = new RegExp(keywords[0], 'gi');
-        const matches = [];
-        for (const match of text.matchAll(regex)) {
-           matches.push(match);
-           if (matches.length > 100) break;
-        }
-        
-        if (matches.length === 0) return <span>{text}</span>;
-        
-        const nodes = [];
-        let lastIndex = 0;
-        matches.forEach((match, i) => {
-          if (match.index !== undefined) {
-             nodes.push(<span key={`text-${i}`}>{text.substring(lastIndex, match.index)}</span>);
-             nodes.push(
-               <mark key={`mark-${i}`} className="bg-blue-500/30 text-blue-400 font-medium px-1 rounded-sm ring-1 ring-blue-500/50">
-                 {match[0]}
-               </mark>
-             );
-             lastIndex = match.index + match[0].length;
-          }
-        });
-        nodes.push(<span key="text-end">{text.substring(lastIndex)}</span>);
-        if (matches.length > 100) {
-            nodes.push(<span key="warning" className="text-[10px] text-amber-500 ml-2">[Highlighting limited to 100 matches]</span>);
-        }
-        return <span>{nodes}</span>;
-      } else {
-        const regex = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi');
-        const parts = text.split(regex);
-        return (
-          <span>
-            {parts.map((part, i) => {
-              const isMatch = keywords.some(k => k.toLowerCase() === part.toLowerCase());
-              return isMatch ? (
-                <mark key={i} className="bg-blue-500/30 text-blue-400 font-medium px-1 rounded-sm ring-1 ring-blue-500/50">
-                  {part}
-                </mark>
-              ) : (
-                <span key={i}>{part}</span>
-              );
-            })}
-          </span>
-        );
-      }
-    } catch (e) {
-      return <span>{text}</span>;
-    }
-  };
-
   const renderPreviewContent = () => {
     const f = activeFile;
     if (!f) return <div className="text-white/50">No file selected.</div>;
@@ -428,7 +415,6 @@ function AppContent() {
       return <pre className="font-mono text-xs whitespace-pre-wrap text-slate-800">{mdContent}</pre>;
     }
 
-    // TXT and PDF
     return (
       <div className={previewFormat === 'pdf' ? "max-w-[180mm] mx-auto bg-white p-8 shadow-sm border border-slate-200" : ""}>
         <pre className={cn("font-mono text-xs whitespace-pre-wrap", previewFormat === 'pdf' ? "text-black font-sans leading-relaxed" : "text-slate-800")}>
@@ -440,41 +426,29 @@ function AppContent() {
 
   return (
     <div className="min-h-screen bg-[#0a0b0e] text-slate-300 font-sans selection:bg-blue-500/30">
-      <AnimatePresence>
-        {previewFormat && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
-          >
-            <motion.div
-              initial={{ scale: 0.95, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-[#0e1014] border border-white/10 rounded-2xl w-full max-w-4xl h-[80vh] flex flex-col overflow-hidden shadow-2xl"
-            >
-              <div className="px-6 py-4 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
-                <h2 className="text-sm font-bold text-white uppercase tracking-widest flex items-center gap-2">
-                  <Eye className="w-4 h-4 text-blue-400" /> Print Preview: {previewFormat.toUpperCase()}
-                </h2>
-                <button onClick={() => setPreviewFormat(null)} className="text-white/40 hover:text-white transition-colors">
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto p-8 bg-slate-100 text-black">
-                 {renderPreviewContent()}
-              </div>
-              <div className="p-4 border-t border-white/5 bg-[#0e1014] flex justify-end gap-3">
-                <button onClick={() => setPreviewFormat(null)} className="px-4 py-2 text-sm text-white/60 hover:text-white transition-colors">Cancel</button>
-                <button onClick={() => { handleExport(previewFormat); setPreviewFormat(null); }} className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors font-medium shadow-lg shadow-blue-500/20">
-                  Download {previewFormat.toUpperCase()}
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {previewFormat && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-[#0e1014] border border-white/10 rounded-2xl w-full max-w-4xl h-[80vh] flex flex-col overflow-hidden shadow-2xl animate-scale-in">
+            <div className="px-6 py-4 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
+              <h2 className="text-sm font-bold text-white uppercase tracking-widest flex items-center gap-2">
+                <Eye className="w-4 h-4 text-blue-400" /> Print Preview: {previewFormat.toUpperCase()}
+              </h2>
+              <button onClick={() => setPreviewFormat(null)} className="text-white/40 hover:text-white transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-8 bg-slate-100 text-black">
+               {renderPreviewContent()}
+            </div>
+            <div className="p-4 border-t border-white/5 bg-[#0e1014] flex justify-end gap-3">
+              <button onClick={() => setPreviewFormat(null)} className="px-4 py-2 text-sm text-white/60 hover:text-white transition-colors">Cancel</button>
+              <button onClick={() => { handleExport(previewFormat); setPreviewFormat(null); }} className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors font-medium shadow-lg shadow-blue-500/20">
+                Download {previewFormat.toUpperCase()}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <header className="h-16 flex items-center justify-between px-6 border-b border-white/10 bg-white/[0.03] backdrop-blur-md sticky top-0 z-10">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded bg-blue-600 flex items-center justify-center">
@@ -521,19 +495,34 @@ function AppContent() {
               <div className="mt-6">
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Queue ({files.length})</h2>
-                  <button onClick={() => { setFiles([]); setActiveFileIndex(-1); parsedTextCache.clear(); }} className="text-[10px] text-red-400 hover:text-red-300">Clear All</button>
+                  <button onClick={handleClearAll} className="text-[10px] text-red-400 hover:text-red-300 transition-colors">Clear All</button>
                 </div>
+
+                {files.length > 3 && (
+                  <div className="relative mb-3">
+                    <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-white/30" />
+                    <input
+                      type="text"
+                      value={queueSearch}
+                      onChange={(e) => setQueueSearch(e.target.value)}
+                      placeholder="Filter queue files..."
+                      className="w-full pl-9 pr-3 py-1.5 bg-white/5 border border-white/10 rounded-md text-xs text-white focus:outline-none focus:border-blue-500/50 placeholder-white/20"
+                    />
+                  </div>
+                )}
+
                 <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {files.map((f, idx) => {
+                  {filteredQueue.map((f) => {
+                    const originalIdx = files.findIndex(fileItem => fileItem.id === f.id);
                     const isSearching = searchResults[f.id]?.isSearching || false;
-                    const matchCount = searchResults[f.id]?.matches?.length || 0;
+                    const matchCount = searchResults[f.id]?.totalMatches || 0;
                     return (
                       <div 
                         key={f.id} 
-                        onClick={() => setActiveFileIndex(idx)}
+                        onClick={() => setActiveFileIndex(originalIdx)}
                         className={cn(
-                          "p-3 rounded-lg border flex items-center gap-3 cursor-pointer transition-colors",
-                          activeFileIndex === idx 
+                          "p-3 rounded-lg border flex items-center gap-3 cursor-pointer transition-colors group relative",
+                          activeFileIndex === originalIdx 
                             ? "bg-blue-500/10 border-blue-500/20" 
                             : "bg-white/[0.03] border-white/5 hover:border-white/10"
                         )}
@@ -544,11 +533,20 @@ function AppContent() {
                         <div className="flex-1 truncate">
                           <div className="text-xs text-white truncate flex items-center justify-between gap-2" title={f.file.name}>
                             <span className="truncate">{f.file.name}</span>
-                            {isSearching ? (
-                              <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
-                            ) : activeKeywords.length > 0 && matchCount > 0 ? (
-                              <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
-                            ) : null}
+                            <div className="flex items-center gap-1 shrink-0">
+                              {isSearching ? (
+                                <div className="w-3.5 h-3.5 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
+                              ) : activeKeywords.length > 0 && matchCount > 0 ? (
+                                <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded shrink-0">{matchCount}</span>
+                              ) : null}
+                              <button
+                                onClick={(e) => removeFile(f.id, e)}
+                                className="p-1 text-white/20 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors opacity-0 group-hover:opacity-100"
+                                title="Remove file"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
                           <div className="text-[10px] text-white/40">{(f.file.size / 1024).toFixed(1)} KB</div>
                         </div>
@@ -639,7 +637,7 @@ function AppContent() {
           </section>
         </div>
 
-        {/* Right Column: Preview */}
+        {/* Right Column: Virtualized Preview */}
         <div className="lg:col-span-8">
           <section className="bg-black/40 rounded-xl border border-white/5 h-[calc(100vh-8rem)] flex flex-col overflow-hidden">
             <div className="px-6 py-4 border-b border-white/5 bg-[#0e1014]/50 flex items-center justify-between">
@@ -647,87 +645,63 @@ function AppContent() {
                 Live Inspection Console 
                 {activeFileSearching ? (
                   <div className="w-3 h-3 border border-blue-500 border-t-transparent rounded-full animate-spin ml-2" />
-                ) : activeKeywords.length > 0 && activeFileMatches.length > 0 ? (
+                ) : activeKeywords.length > 0 && activeFileTotalMatches > 0 ? (
                   <span className="text-blue-400 ml-2 border border-blue-500/30 bg-blue-500/10 px-2 py-0.5 rounded">
-                    ({activeFileMatches.length} matches)
+                    ({activeFileTotalMatches} matches)
                   </span>
                 ) : null}
               </h2>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-6 bg-transparent font-mono text-[13px] text-white/80 leading-relaxed whitespace-pre-wrap">
-              <AnimatePresence mode="wait">
-                {isProcessing ? (
-                  <motion.div 
-                    key="processing"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col items-center justify-center h-full text-white/40 space-y-4"
-                  >
-                    <div className="relative flex items-center justify-center">
-                      <div className="w-12 h-12 border-4 border-white/5 border-t-blue-500 rounded-full animate-spin" />
-                      <span className="absolute text-[10px] font-bold text-blue-400 font-mono">{parseProgress}%</span>
+            <div className="flex-1 p-6 bg-transparent overflow-hidden">
+              {isProcessing ? (
+                <div className="flex flex-col items-center justify-center h-full text-white/40 space-y-4 animate-fade-in">
+                  <div className="relative flex items-center justify-center">
+                    <div className="w-12 h-12 border-4 border-white/5 border-t-blue-500 rounded-full animate-spin" />
+                    <span className="absolute text-[10px] font-bold text-blue-400 font-mono">{parseProgress}%</span>
+                  </div>
+                  <div className="text-center space-y-1">
+                    <p className="text-xs text-white/80 font-semibold">[SYSTEM] Parsing & converting source chunks via Web Worker...</p>
+                    <p className="text-[10px] text-white/40">Background thread processing • {parseProgress}% complete</p>
+                  </div>
+                </div>
+              ) : !activeFile ? (
+                <div className="flex flex-col items-center justify-center h-full text-white/20 animate-fade-in">
+                  <FileType className="w-12 h-12 mb-3 text-white/10" />
+                  <p>Awaiting source file...</p>
+                </div>
+              ) : (
+                <div className="flex flex-col h-full space-y-4">
+                  {activeKeywords.length > 0 && activeFileMatches.length > 0 && (
+                    <div className="p-4 bg-blue-500/5 border border-blue-500/20 rounded-xl shrink-0">
+                      <h3 className="font-bold text-xs text-blue-400 mb-3 uppercase tracking-widest flex items-center gap-2">
+                        [KEYWORD MATCHES] ({activeFileTotalMatches})
+                        {activeFileSearching && <div className="w-3 h-3 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />}
+                      </h3>
+                      <ul className="space-y-2 max-h-48 overflow-y-auto pr-2">
+                        {activeFileMatches.slice(0, 50).map((match, idx) => (
+                          <li key={idx} className="p-2.5 bg-black/40 rounded-lg text-xs border border-white/5 text-white/60 font-mono truncate">
+                            <HighlightedLine line={match} keywords={activeKeywords} isRegex={useRegex} />
+                          </li>
+                        ))}
+                        {activeFileTotalMatches > 50 && (
+                          <li className="text-center text-blue-400/60 text-xs mt-2">
+                            + {activeFileTotalMatches - 50} more hits...
+                          </li>
+                        )}
+                      </ul>
                     </div>
-                    <div className="text-center space-y-1">
-                      <p className="text-xs text-white/80 font-semibold">[SYSTEM] Parsing & converting source chunks...</p>
-                      <p className="text-[10px] text-white/40">Keep browser tab active • {parseProgress}% complete</p>
-                    </div>
-                  </motion.div>
-                ) : !activeFile ? (
-                  <motion.div 
-                    key="empty"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col items-center justify-center h-full text-white/20"
-                  >
-                    <FileType className="w-12 h-12 mb-3 text-white/10" />
-                    <p>Awaiting source file...</p>
-                  </motion.div>
-                ) : (
-                  <motion.div 
-                    key="content"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                  >
-                    {activeKeywords.length > 0 && activeFileMatches.length > 0 && (
-                      <div className="mb-6 p-4 bg-blue-500/5 border border-blue-500/20 rounded-xl">
-                        <h3 className="font-bold text-xs text-blue-400 mb-3 uppercase tracking-widest flex items-center gap-2">
-                          [KEYWORD MATCHES] ({activeFileMatches.length})
-                          {activeFileSearching && <div className="w-3 h-3 border border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />}
-                        </h3>
-                        <ul className="space-y-2 max-h-64 overflow-y-auto pr-2">
-                          {activeFileMatches.slice(0, 50).map((match, idx) => (
-                            <li key={idx} className="p-3 bg-black/40 rounded-lg text-xs border border-white/5 text-white/60">
-                              <HighlightedText text={match} keywords={activeKeywords} isRegex={useRegex} />
-                            </li>
-                          ))}
-                          {activeFileMatches.length > 50 && (
-                            <li className="text-center text-blue-400/60 text-xs mt-2">
-                              + {activeFileMatches.length - 50} more hits...
-                            </li>
-                          )}
-                        </ul>
-                      </div>
-                    )}
-                    
-                    <div className="opacity-70 hover:opacity-100 transition-opacity">
-                      {activeFile.previewText.length > 20000 ? (
-                        <>
-                          <HighlightedText text={activeFile.previewText.substring(0, 20000)} keywords={activeKeywords} isRegex={useRegex} />
-                          <div className="mt-4 pt-4 text-center border-t border-white/10 text-white/40 text-xs">
-                            [SYSTEM] Output truncated for performance. Full document preserved in memory.
-                          </div>
-                        </>
-                      ) : (
-                        <HighlightedText text={activeFile.previewText} keywords={activeKeywords} isRegex={useRegex} />
-                      )}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+                  )}
+
+                  <div className="flex-1 min-h-0 bg-black/20 rounded-lg border border-white/5 p-4">
+                    <VirtualizedText
+                      text={parsedTextCache.get(activeFile.id) || activeFile.previewText}
+                      keywords={activeKeywords}
+                      isRegex={useRegex}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         </div>

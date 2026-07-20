@@ -27,8 +27,17 @@ function generatePdfDoc(text: string): jsPDF {
   const pageHeight = doc.internal.pageSize.height;
   const margin = 15;
   const maxWidth = 180;
-  
-  const lines = doc.splitTextToSize(text, maxWidth);
+  const maxPdfLines = 5000;
+
+  let textToRender = text;
+  const totalLineCount = (text.match(/\n/g) || []).length + 1;
+
+  if (totalLineCount > maxPdfLines) {
+    const truncatedText = text.split('\n').slice(0, maxPdfLines).join('\n');
+    textToRender = `${truncatedText}\n\n--- [PDF EXPORT TRUNCATED AT ${maxPdfLines} LINES] ---\n[Use TXT or Markdown export to view full ${totalLineCount.toLocaleString()} lines]`;
+  }
+
+  const lines = doc.splitTextToSize(textToRender, maxWidth);
   let cursorY = margin;
 
   for (let i = 0; i < lines.length; i++) {
@@ -37,7 +46,7 @@ function generatePdfDoc(text: string): jsPDF {
       cursorY = margin;
     }
     doc.text(lines[i], margin, cursorY);
-    cursorY += 6; // approximate line height for default font
+    cursorY += 6;
   }
   return doc;
 }

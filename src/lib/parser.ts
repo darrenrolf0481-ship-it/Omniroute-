@@ -75,7 +75,7 @@ function stripTag(text: string, tag: string) {
     result += text.slice(i, start);
     const end = lowerText.indexOf(closeTag, start);
     if (end === -1) {
-      result += text.slice(start);
+      // Tag was not closed in this text, drop remaining text from start tag
       break;
     }
     i = end + closeTag.length;
@@ -91,7 +91,8 @@ async function parseMht(file: File, onProgress?: (p: number) => void): Promise<s
   let carryOver = "";
   const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   
-  const base64Regex = /^[A-Za-z0-9+/]{70,80}={0,2}\r?$/;
+  const base64Regex = /^[A-Za-z0-9+/=]{40,120}\r?$/;
+  let inBase64Block = false;
 
   while (offset < totalSize) {
     const end = Math.min(offset + chunkSize, totalSize);
@@ -119,17 +120,38 @@ async function parseMht(file: File, onProgress?: (p: number) => void): Promise<s
     const filteredLines = [];
     
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      // 1. Remove base64 image data blocks
-      if (line.length >= 70 && line.length <= 82 && base64Regex.test(line)) {
+      const line = lines[i].trimEnd();
+      const trimmed = line.trim();
+
+      // Detect start of Base64 encoding block
+      if (/^Content-Transfer-Encoding:\s*base64/i.test(trimmed)) {
+        inBase64Block = true;
         continue;
       }
-      
-      // 2. Remove standard MIME headers
-      if (/^(Content-Type|Content-Transfer-Encoding|Content-Location|Date|MIME-Version):.*$/i.test(line)) {
+
+      // MIME boundary resets base64 block state
+      if (/^------=_NextPart_/i.test(trimmed) || /^--/i.test(trimmed)) {
+        inBase64Block = false;
         continue;
       }
-      if (/^------=_NextPart_/i.test(line)) {
+
+      if (inBase64Block) {
+        // Skip base64 payload lines
+        if (trimmed.length === 0 || base64Regex.test(trimmed)) {
+          continue;
+        } else {
+          // End of base64 payload
+          inBase64Block = false;
+        }
+      }
+
+      // Remove standard MIME headers
+      if (/^(Content-Type|Content-Transfer-Encoding|Content-Location|Content-ID|Content-Disposition|Date|MIME-Version):.*$/i.test(trimmed)) {
+        continue;
+      }
+
+      // Standalone base64 image data lines filter
+      if (trimmed.length >= 40 && base64Regex.test(trimmed)) {
         continue;
       }
       
@@ -138,7 +160,7 @@ async function parseMht(file: File, onProgress?: (p: number) => void): Promise<s
     
     let processedChunk = filteredLines.join('\n');
     
-    // 3. Decode Quoted-Printable
+    // Decode Quoted-Printable
     processedChunk = processedChunk.replace(/=([0-9A-F]{2})/gi, (match, hex) => {
       try {
         return String.fromCharCode(parseInt(hex, 16));
@@ -148,19 +170,19 @@ async function parseMht(file: File, onProgress?: (p: number) => void): Promise<s
     });
     processedChunk = processedChunk.replace(/=\r?\n/g, ''); // Soft line breaks
 
-    // 4. Strip HTML tags safely
+    // Strip HTML tags safely
     processedChunk = stripTag(processedChunk, 'style');
     processedChunk = stripTag(processedChunk, 'script');
     processedChunk = processedChunk.replace(/<[^>]+>/g, ' ');
 
-    // 5. Decode basic HTML entities per chunk to prevent giant global operations
+    // Decode basic HTML entities per chunk to prevent giant global operations
     processedChunk = processedChunk.replace(/&nbsp;/gi, ' ');
     processedChunk = processedChunk.replace(/&lt;/gi, '<');
     processedChunk = processedChunk.replace(/&gt;/gi, '>');
     processedChunk = processedChunk.replace(/&amp;/gi, '&');
     processedChunk = processedChunk.replace(/&quot;/gi, '"');
 
-    // 6. Clean up excessive whitespace per chunk to prevent giant global operations
+    // Clean up excessive whitespace per chunk to prevent giant global operations
     processedChunk = processedChunk.replace(/[ \t]{2,}/g, ' ');
     processedChunk = processedChunk.replace(/\n\s*\n/g, '\n\n');
 
